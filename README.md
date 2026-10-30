@@ -9,9 +9,18 @@ baudsh runs a shell or command in a pseudo-terminal and limits the bytes flowing
 
 It does not open serial ports, change hardware settings, or isolate the command it runs.
 
-## Status and downloads
+## Downloads
 
-Version **1.0.0** is being prepared. There are no published binary releases yet; build from source using the instructions below. When available, release packages will appear on the [Releases page](https://github.com/Davoda1/baudsh/releases).
+Version **1.0.0** is available on the [Releases page](https://github.com/Davoda1/baudsh/releases/tag/v1.0.0):
+
+| Platform | Download | Contents |
+| --- | --- | --- |
+| Windows 10/11 x64 | [Portable ZIP](https://github.com/Davoda1/baudsh/releases/download/v1.0.0/baudsh-1.0.0-windows-x64.zip) | `baudsh.exe` at the archive root |
+| Linux amd64 | [Portable tar.gz](https://github.com/Davoda1/baudsh/releases/download/v1.0.0/baudsh-1.0.0-linux-amd64.tar.gz) | `baudsh` at the archive root |
+| Debian-based Linux amd64 | [Debian package](https://github.com/Davoda1/baudsh/releases/download/v1.0.0/baudsh-1.0.0-linux-amd64.deb) | Installs the executable as `/usr/bin/baudsh` |
+| All platforms | [SHA256SUMS.txt](https://github.com/Davoda1/baudsh/releases/download/v1.0.0/SHA256SUMS.txt) | Checksums for the packaged downloads |
+
+Source archives are also available from the release page. You can verify a downloaded file against its entry in `SHA256SUMS.txt`; on Linux, run `sha256sum -c SHA256SUMS.txt` from the directory containing all the files listed in it. The portable packages require no installation. To install the Debian package, use `sudo apt install ./baudsh-1.0.0-linux-amd64.deb`; remove it with `sudo apt remove baudsh`.
 
 The [CI workflow](https://github.com/Davoda1/baudsh/actions/workflows/ci.yml) is the source of current build and automated test results. Manual console testing is also needed to assess host-specific keyboard behavior and terminal applications.
 
@@ -26,13 +35,15 @@ Linux and Windows share the main options, but their shells, signals, quoting rul
 
 ## Quick start
 
-After building on Linux:
+After extracting the Linux portable archive or building from source:
 
 ```sh
 ./baudsh --baud 300
 ```
 
-After building on Windows, run from PowerShell or Command Prompt:
+If installed from the Debian package, use `baudsh --baud 300` instead.
+
+After extracting the Windows portable archive or building from source, run from PowerShell or Command Prompt:
 
 ```powershell
 .\baudsh.exe --baud 300

@@ -1,8 +1,8 @@
 # Changelog
 
-## 1.0.0 — Unreleased
+## 1.0.0
 
-The first packaged release is in preparation.
+The first packaged release for Windows x64 and Linux amd64.
 
 ### Features
 
