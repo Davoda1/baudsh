@@ -1,21 +1,6 @@
 /*
-    baudsh — PTY wrapper that simulates serial baud rates by throttling bytes in both directions.
-
-    FIXES INCLUDED (important):
-      1) Proper job control on PTY slave:
-            setsid() + TIOCSCTTY + setpgid(0,0) + tcsetpgrp(slave, getpgrp())
-         This prevents nested shells (e.g. running `sh` inside) from being stopped by SIGTTIN.
-
-      2) No more bogus "openpty/fork failed: Inappropriate ioctl for device":
-         - We do NOT allow a failing TIOCGWINSZ to poison errno.
-         - We call openpty() with explicit termios + winsize (or safe defaults).
-
-      3) Child/parent return handling is correct:
-         - Child does NOT return a SpawnResult that makes main() think openpty/fork failed.
-         - Child proceeds directly to exec.
-
-    Build (Linux static):
-      g++ -std=c++17 -Wall -Wextra -pedantic -O2 baudsh.cpp -o baudsh -static -static-libstdc++ -static-libgcc -lutil
+    baudsh — throttle bytes between a terminal and a child PTY.
+    Build: g++ -std=c++17 -O2 baudsh_main.cpp baudsh_posix.cpp -o baudsh -lutil
 */
 
 #include <algorithm>
@@ -25,6 +10,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <climits>
 #include <ctime>
 #include <string>
 #include <vector>
@@ -48,9 +34,11 @@
 
 static volatile sig_atomic_t g_winch_pending = 1;
 static volatile sig_atomic_t g_term_pending  = 0;
+static volatile sig_atomic_t g_suspend_pending = 0;
 
 static void on_winch(int) { g_winch_pending = 1; }
-static void on_term(int)  { g_term_pending  = 1; }
+static void on_term(int sig)  { g_term_pending = sig; }
+static void on_suspend(int) { g_suspend_pending = 1; }
 
 // -------------------- time --------------------
 
@@ -289,7 +277,7 @@ static void print_help(const char* prog) {
         "  --parity <n|e|o>       Default: n\n"
         "  --stop-bits <1|1.5|2>  Default: 1\n"
         "  --burst-ms <ms>        Default: 200\n"
-        "  --exit-key <spec>      ctrl+f7 | raw:<seq> | none (default: ctrl+f7)\n"
+        "  --exit-key <spec>      ctrl+f7 | ctrl+<key> | raw:<seq> | none (default: ctrl+f7)\n"
         "  --exit-arm-ms <ms>     Default: 250\n"
         "  --cmd <...>            Run command. If single string, uses /bin/sh -lc.\n"
         "                         [must be last flag if used]\n"
@@ -312,6 +300,24 @@ static void print_help(const char* prog) {
     );
 }
 
+static bool parse_int(const char* text, int& value) {
+    char* end = nullptr;
+    errno = 0;
+    long n = std::strtol(text, &end, 10);
+    if (errno || end == text || *end != '\0' || n < INT_MIN || n > INT_MAX) return false;
+    value = static_cast<int>(n);
+    return true;
+}
+
+static bool parse_double(const char* text, double& value) {
+    char* end = nullptr;
+    errno = 0;
+    double n = std::strtod(text, &end);
+    if (errno || end == text || *end != '\0') return false;
+    value = n;
+    return true;
+}
+
 static bool parse_args(int argc, char** argv, Args& out) {
     for (int i = 1; i < argc; ++i) {
         std::string a = argv[i];
@@ -321,10 +327,10 @@ static bool parse_args(int argc, char** argv, Args& out) {
             std::exit(0);
         } else if (a == "--baud") {
             if (i + 1 >= argc) return false;
-            out.baud = std::atoi(argv[++i]);
+            if (!parse_int(argv[++i], out.baud) || out.baud <= 0) return false;
         } else if (a == "--data-bits") {
             if (i + 1 >= argc) return false;
-            out.data_bits = std::atoi(argv[++i]);
+            if (!parse_int(argv[++i], out.data_bits)) return false;
             if (!(out.data_bits == 5 || out.data_bits == 6 || out.data_bits == 7 || out.data_bits == 8)) return false;
         } else if (a == "--parity") {
             if (i + 1 >= argc) return false;
@@ -335,20 +341,19 @@ static bool parse_args(int argc, char** argv, Args& out) {
             out.parity = c;
         } else if (a == "--stop-bits") {
             if (i + 1 >= argc) return false;
-            out.stop_bits = std::atof(argv[++i]);
+            if (!parse_double(argv[++i], out.stop_bits)) return false;
             if (!(out.stop_bits == 1.0 || out.stop_bits == 1.5 || out.stop_bits == 2.0)) return false;
         } else if (a == "--burst-ms") {
             if (i + 1 >= argc) return false;
-            out.burst_ms = std::atoi(argv[++i]);
-            if (out.burst_ms < 1) out.burst_ms = 1;
+            if (!parse_int(argv[++i], out.burst_ms) || out.burst_ms < 1) return false;
         } else if (a == "--exit-key") {
             if (i + 1 >= argc) return false;
             out.exit_key = argv[++i];
         } else if (a == "--exit-arm-ms") {
             if (i + 1 >= argc) return false;
-            out.exit_arm_ms = std::atoi(argv[++i]);
-            if (out.exit_arm_ms < 0) out.exit_arm_ms = 0;
+            if (!parse_int(argv[++i], out.exit_arm_ms) || out.exit_arm_ms < 0) return false;
         } else if (a == "--cmd") {
+            if (i + 1 >= argc) return false;
             out.has_cmd = true;
             out.cmd.clear();
             for (int j = i + 1; j < argc; ++j) out.cmd.emplace_back(argv[j]);
@@ -364,7 +369,11 @@ static bool parse_args(int argc, char** argv, Args& out) {
         }
     }
     // baud can be provided by config; only require it in the final resolved args.
-    return out.baud > 0 || out.print_effective;
+    return (out.baud > 0 || (out.baud == -1 && out.print_effective)) &&
+        out.data_bits >= 5 && out.data_bits <= 8 &&
+        (out.parity == 'n' || out.parity == 'e' || out.parity == 'o') &&
+        (out.stop_bits == 1.0 || out.stop_bits == 1.5 || out.stop_bits == 2.0) &&
+        out.burst_ms >= 1 && out.exit_arm_ms >= 0;
 }
 
 // -------------------- spawn PTY (forkpty = python pty.fork semantics) --------------------
@@ -426,6 +435,11 @@ static void child_exec_or_die(const Args& args) {
         die("exec login shell failed");
     }
 
+    if (args.cmd.size() == 1) {
+        execl("/bin/sh", "sh", "-lc", args.cmd[0].c_str(), (char*)nullptr);
+        die("exec shell failed");
+    }
+
     std::vector<char*> cargv;
     cargv.reserve(args.cmd.size() + 1);
     for (auto& s : args.cmd) cargv.push_back(const_cast<char*>(s.c_str()));
@@ -483,6 +497,9 @@ int baudsh_posix_main(int argc, char** argv) {
         } else if (ek == "ctrl+f7") {
             const unsigned char seq[] = {0x1B,'[','1','8',';','5','~'};
             exit_seq.assign(seq, seq + sizeof(seq));
+        } else if (ek.size() == 6 && ek.compare(0, 5, "ctrl+") == 0 &&
+                   ((ek[5] >= 'a' && ek[5] <= 'z') || ek[5] == ']' || ek[5] == '[' || ek[5] == '\\' || ek[5] == '^' || ek[5] == '_')) {
+            exit_seq.push_back(static_cast<unsigned char>(std::toupper(static_cast<unsigned char>(ek[5])) & 0x1f));
         } else if (ek.rfind("raw:", 0) == 0) {
             exit_seq = parse_raw_seq(args.exit_key.substr(4));
             if (exit_seq.empty()) exit_enabled = false;
@@ -507,6 +524,11 @@ int baudsh_posix_main(int argc, char** argv) {
         sigaction(SIGTERM, &sa, nullptr);
         sigaction(SIGHUP, &sa, nullptr);
         sigaction(SIGQUIT, &sa, nullptr);
+    }
+    {
+        struct sigaction sa{};
+        sa.sa_handler = on_suspend;
+        sigaction(SIGTSTP, &sa, nullptr);
     }
 
     // read terminal attributes
@@ -559,6 +581,14 @@ int baudsh_posix_main(int argc, char** argv) {
         }
     }
 
+    // Preserve inherited descriptor flags as these can be shared with the parent shell.
+    const int stdin_flags = fcntl(STDIN_FILENO, F_GETFL, 0);
+    const int stdout_flags = fcntl(STDOUT_FILENO, F_GETFL, 0);
+    // Parent handles a closed output pipe and still restores the terminal.
+    struct sigaction ignore_pipe{};
+    ignore_pipe.sa_handler = SIG_IGN;
+    sigaction(SIGPIPE, &ignore_pipe, nullptr);
+
     // nonblocking IO
     set_nonblocking(STDIN_FILENO);
     set_nonblocking(master_fd);
@@ -566,6 +596,8 @@ int baudsh_posix_main(int argc, char** argv) {
 
     auto cleanup_all = [&]() {
         if (master_fd >= 0) close(master_fd);
+        if (stdin_flags >= 0) (void)fcntl(STDIN_FILENO, F_SETFL, stdin_flags);
+        if (stdout_flags >= 0) (void)fcntl(STDOUT_FILENO, F_SETFL, stdout_flags);
         restore_local_tty();
     };
 
@@ -592,12 +624,18 @@ const double ESC_TIMEOUT_SEC = 1.5;
 // Partial matching for the escape sequence while parsing stdin stream
 std::vector<unsigned char> esc_partial;
 size_t esc_match = 0;
+double esc_partial_at = 0.0;
+const double ESC_PARTIAL_TIMEOUT_SEC = 0.1;
 
 std::vector<unsigned char> esc2_partial;
 size_t esc2_match = 0;
 
     bool child_exited = false;
+    int child_status = 0;
     bool master_eof = false;
+    bool input_closed = false;
+    bool io_error = false;
+    constexpr size_t BUFFER_LIMIT = 65536;
 
     auto emergency_exit = [&]() {
         // Immediate local exit: do not wait for child to finish / buffers to drain.
@@ -614,10 +652,39 @@ size_t esc2_match = 0;
         in_bucket.refill(now);
         out_bucket.refill(now);
 
+        if (g_suspend_pending) {
+            g_suspend_pending = 0;
+            // Restore the invoking terminal before actually stopping this process.
+            // The child has a separate PTY session, so suspend and resume its
+            // foreground group along with the wrapper when one exists.
+            pid_t foreground = tcgetpgrp(master_fd);
+            if (foreground <= 0 || foreground == getpgrp()) foreground = child_pgrp_ok ? child : -1;
+            if (foreground > 0) (void)killpg(foreground, SIGTSTP);
+            if (stdin_flags >= 0) (void)fcntl(STDIN_FILENO, F_SETFL, stdin_flags);
+            if (stdout_flags >= 0) (void)fcntl(STDOUT_FILENO, F_SETFL, stdout_flags);
+            restore_local_tty();
+            (void)kill(getpid(), SIGSTOP);
+            // Execution continues here after SIGCONT.
+            if (tcsetattr(STDIN_FILENO, TCSANOW, &raw) != 0) {
+                dprintf(2, "baudsh: failed to restore raw mode after resume: %s\n", strerror(errno));
+                if (foreground > 0) (void)killpg(foreground, SIGHUP);
+                else (void)kill(child, SIGHUP);
+                io_error = true;
+                break;
+            }
+            set_nonblocking(STDIN_FILENO);
+            set_nonblocking(STDOUT_FILENO);
+            if (foreground > 0) (void)killpg(foreground, SIGCONT);
+        }
+
         if (g_term_pending) {
+            int sig = g_term_pending;
             g_term_pending = 0;
-            if (child_pgrp_ok) killpg(child, SIGTERM);
-            else kill(child, SIGTERM);
+            // The foreground job may differ from the shell's process group.
+            pid_t foreground = tcgetpgrp(master_fd);
+            if (foreground > 0 && foreground != getpgrp()) (void)killpg(foreground, sig);
+            else if (child_pgrp_ok) (void)killpg(child, sig);
+            else (void)kill(child, sig);
         }
 
         if (g_winch_pending) {
@@ -630,16 +697,30 @@ size_t esc2_match = 0;
         }
 
         if (!child_exited) {
-            int status = 0;
-            pid_t w = waitpid(child, &status, WNOHANG);
+            pid_t w = waitpid(child, &child_status, WNOHANG);
             if (w == child) child_exited = true;
+            else if (w < 0 && errno != EINTR) { child_exited = true; io_error = true; }
         }
 
 
-// stdin -> stdin_buf (with escape prefix parsing)
-for (;;) {
+// Flush an incomplete key sequence after a short inter-byte timeout.
+if (esc_match && now - esc_partial_at >= ESC_PARTIAL_TIMEOUT_SEC) {
+    stdin_buf.append(esc_partial.data(), esc_partial.size());
+    esc_partial.clear();
+    esc_match = 0;
+}
+if (esc_armed && now - esc_armed_at > ESC_TIMEOUT_SEC) {
+    if (!esc2_partial.empty()) stdin_buf.append(esc2_partial.data(), esc2_partial.size());
+    esc2_partial.clear();
+    esc2_match = 0;
+    esc_armed = false;
+}
+
+// stdin -> stdin_buf (with escape prefix parsing); stop reading when the queue is full.
+while (!input_closed && !master_eof && !child_exited && stdin_buf.size() < BUFFER_LIMIT) {
     unsigned char tmp[8192];
-    ssize_t r = read_nb(STDIN_FILENO, tmp, sizeof(tmp));
+    const size_t room = BUFFER_LIMIT - stdin_buf.size();
+    ssize_t r = read_nb(STDIN_FILENO, tmp, std::min(sizeof(tmp), room));
     if (r > 0) {
         did = true;
 
@@ -652,6 +733,7 @@ for (;;) {
             // Timeout: if prefix was pressed but no follow-up arrived, disarm.
             if (esc_armed && (now2 - esc_armed_at) > ESC_TIMEOUT_SEC) {
                 esc_armed = false;
+                if (!esc2_partial.empty()) stdin_buf.append(esc2_partial.data(), esc2_partial.size());
                 esc2_partial.clear();
                 esc2_match = 0;
             }
@@ -679,7 +761,8 @@ for (;;) {
                         esc2_partial.clear();
                         esc2_match = 0;
                         esc_armed = false;
-                        // fallthrough to normal handling of b
+                        stdin_buf.append(&b, 1);
+                        continue;
                     }
                 }
 
@@ -703,6 +786,7 @@ for (;;) {
             if (esc_active) {
                 if (b == exit_seq[esc_match]) {
                     esc_partial.push_back(b);
+                    esc_partial_at = now2;
                     esc_match++;
                     if (esc_match == exit_seq.size()) {
                         // Prefix detected: arm escape, do NOT forward prefix bytes.
@@ -724,6 +808,7 @@ for (;;) {
                 // If current byte could be start of prefix again, start buffering it.
                 if (!exit_seq.empty() && b == exit_seq[0]) {
                     esc_partial.push_back(b);
+                    esc_partial_at = now2;
                     esc_match = 1;
                     continue;
                 }
@@ -736,14 +821,24 @@ for (;;) {
         continue;
     }
     if (r == -2) break;
+    // Raw terminal input has no in-band EOF. Losing the invoking terminal
+    // must not leave a detached wrapper waiting forever for more keystrokes.
+    input_closed = true;
+    io_error = true;
     break;
 }
+        if (io_error) {
+            pid_t foreground = tcgetpgrp(master_fd);
+            if (foreground > 0 && foreground != getpgrp()) (void)killpg(foreground, SIGHUP);
+            if (!child_exited) (void)kill(child, SIGHUP);
+            break;
+        }
 
         // PTY -> pty_buf
         if (!master_eof) {
-            for (;;) {
+            while (pty_buf.size() < BUFFER_LIMIT) {
                 unsigned char tmp[8192];
-                ssize_t r = read_nb(master_fd, tmp, sizeof(tmp));
+                ssize_t r = read_nb(master_fd, tmp, std::min(sizeof(tmp), BUFFER_LIMIT - pty_buf.size()));
                 if (r > 0) {
                     did = true;
                     pty_buf.append(tmp, (size_t)r);
@@ -751,6 +846,12 @@ for (;;) {
                 }
                 if (r == -2) break;
                 master_eof = true;
+                stdin_buf.consume(stdin_buf.size());
+                esc_partial.clear();
+                esc_match = 0;
+                esc2_partial.clear();
+                esc2_match = 0;
+                esc_armed = false;
                 break;
             }
         }
@@ -765,6 +866,10 @@ for (;;) {
                     did = true;
                     in_bucket.consume((size_t)w);
                     stdin_buf.consume((size_t)w);
+                } else if (w == -1) {
+                    // No further input can be delivered to this PTY.
+                    input_closed = true;
+                    stdin_buf.consume(stdin_buf.size());
                 }
             }
         }
@@ -779,6 +884,13 @@ for (;;) {
                     did = true;
                     out_bucket.consume((size_t)w);
                     pty_buf.consume((size_t)w);
+                } else if (w == -1) {
+                    io_error = true;
+                    if (!child_exited) {
+                        if (child_pgrp_ok) (void)killpg(child, SIGHUP);
+                        else (void)kill(child, SIGHUP);
+                    }
+                    break;
                 }
             }
         }
@@ -792,6 +904,9 @@ for (;;) {
     }
 
     cleanup_all();
-    return 0;
+    if (io_error) return 1;
+    if (WIFEXITED(child_status)) return WEXITSTATUS(child_status);
+    if (WIFSIGNALED(child_status)) return 128 + WTERMSIG(child_status);
+    return 1;
 }
 

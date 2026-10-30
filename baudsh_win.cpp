@@ -1,6 +1,9 @@
 #ifdef _WIN32
 
 #define WIN32_LEAN_AND_MEAN
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
 #include <windows.h>
 
 #include <algorithm>
@@ -30,10 +33,9 @@ static inline T load_proc(HMODULE mod, const char* name) {
 // Some MinGW-w64 headers (or older Windows SDKs) may not define ConPTY types/constants.
 // We provide minimal fallbacks so the code can compile, then resolve symbols at runtime.
 //
-// HPCON is an opaque handle type used by ConPTY APIs.
-#ifndef HPCON
-typedef void* HPCON;
-#endif
+// Use a private opaque handle alias: HPCON is a typedef, so #ifndef cannot
+// reliably detect it across Windows SDK versions. The APIs are loaded below.
+using PseudoConsoleHandle = void*;
 
 // PROC_THREAD_ATTRIBUTE_PSEUDOCONSOLE is the attribute used with UpdateProcThreadAttribute.
 // Many references (including Microsoft examples) use value 0x00020016.
@@ -46,15 +48,15 @@ typedef void* HPCON;
 #endif
 
 #ifndef ENABLE_VIRTUAL_TERMINAL_PROCESSING
-#define ENABLE_VIRTUAL_TERMINAL_PROCESSING 0x0200
+#define ENABLE_VIRTUAL_TERMINAL_PROCESSING 0x0004
 #endif
 
 
 // -------------------- ConPTY typedefs --------------------
 
-typedef HRESULT (WINAPI *CreatePseudoConsole_t)(COORD, HANDLE, HANDLE, DWORD, HPCON*);
-typedef void    (WINAPI *ClosePseudoConsole_t)(HPCON);
-typedef HRESULT (WINAPI *ResizePseudoConsole_t)(HPCON, COORD);
+typedef HRESULT (WINAPI *CreatePseudoConsole_t)(COORD, HANDLE, HANDLE, DWORD, PseudoConsoleHandle*);
+typedef void    (WINAPI *ClosePseudoConsole_t)(PseudoConsoleHandle);
+typedef HRESULT (WINAPI *ResizePseudoConsole_t)(PseudoConsoleHandle, COORD);
 
 static CreatePseudoConsole_t pCreatePseudoConsole = nullptr;
 static ClosePseudoConsole_t  pClosePseudoConsole  = nullptr;
@@ -77,10 +79,49 @@ static void close_handle(HANDLE& h) {
 
 static std::wstring utf8_to_utf16(const std::string& s) {
     if (s.empty()) return L"";
-    int n = MultiByteToWideChar(CP_UTF8, 0, s.c_str(), (int)s.size(), nullptr, 0);
+    int n = MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, s.c_str(), (int)s.size(), nullptr, 0);
+    if (n <= 0) throw std::runtime_error("baudsh(win): invalid UTF-8 text");
     std::wstring out((size_t)n, L'\0');
-    MultiByteToWideChar(CP_UTF8, 0, s.c_str(), (int)s.size(), out.data(), n);
+    if (!MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, s.c_str(), (int)s.size(), out.data(), n))
+        throw std::runtime_error("baudsh(win): could not convert UTF-8 text");
     return out;
+}
+
+
+static std::string utf16_to_utf8(const wchar_t* s) {
+    if (!s || !*s) return {};
+    int n = WideCharToMultiByte(CP_UTF8, WC_ERR_INVALID_CHARS, s, -1, nullptr, 0, nullptr, nullptr);
+    if (n <= 0) throw std::runtime_error("baudsh(win): invalid Unicode command line");
+    std::string out((size_t)n, '\0');
+    if (!WideCharToMultiByte(CP_UTF8, WC_ERR_INVALID_CHARS, s, -1, out.data(), n, nullptr, nullptr))
+        throw std::runtime_error("baudsh(win): could not convert Unicode command line");
+    out.pop_back();
+    return out;
+}
+
+// Obtain native Unicode arguments rather than treating the CRT's current
+// system-codepage argv as UTF-8. Resolve shell32 dynamically so existing
+// build commands do not need an additional link library.
+static std::vector<std::string> unicode_command_line_args() {
+    using ParseCommandLine = LPWSTR* (WINAPI *)(LPCWSTR, int*);
+    HMODULE shell = LoadLibraryW(L"shell32.dll");
+    if (!shell) throw std::runtime_error("baudsh(win): cannot load shell32.dll");
+    auto parse = load_proc<ParseCommandLine>(shell, "CommandLineToArgvW");
+    if (!parse) { FreeLibrary(shell); throw std::runtime_error("baudsh(win): cannot parse command line"); }
+    int count = 0;
+    LPWSTR* values = parse(GetCommandLineW(), &count);
+    if (!values) { FreeLibrary(shell); throw std::runtime_error("baudsh(win): cannot parse command line"); }
+    std::vector<std::string> result;
+    try {
+        for (int i = 0; i < count; ++i) result.push_back(utf16_to_utf8(values[i]));
+    } catch (...) {
+        LocalFree(values);
+        FreeLibrary(shell);
+        throw;
+    }
+    LocalFree(values);
+    FreeLibrary(shell);
+    return result;
 }
 
 
@@ -107,7 +148,8 @@ struct ConsoleModeGuard {
             DWORD m = in_mode_old;
             m &= ~ENABLE_VIRTUAL_TERMINAL_INPUT;
             // Disable cooked input so keystrokes stream to the child PTY (like POSIX raw mode).
-            m &= ~(ENABLE_ECHO_INPUT | ENABLE_LINE_INPUT);
+            m &= ~(ENABLE_ECHO_INPUT | ENABLE_LINE_INPUT | ENABLE_PROCESSED_INPUT);
+            m |= ENABLE_WINDOW_INPUT;
             SetConsoleMode(hin, m);
         }
         if (has_out) {
@@ -159,14 +201,22 @@ struct ConsoleCodePageGuard {
 };
 
 
-// Windows CreateProcess quoting rules (simple safe quoting)
+// Escape backslashes preceding quotes and the closing quote according to
+// the Windows C runtime argument parsing convention.
 static std::wstring quote_arg(const std::wstring& a) {
-    std::wstring out;
-    out.push_back(L'"');
+    std::wstring out(1, L'"');
+    size_t slashes = 0;
     for (wchar_t ch : a) {
-        if (ch == L'"') out.push_back(L'\\');
+        if (ch == L'\\') { ++slashes; continue; }
+        if (ch == L'"') {
+            out.append(slashes * 2 + 1, L'\\');
+        } else {
+            out.append(slashes, L'\\');
+        }
+        slashes = 0;
         out.push_back(ch);
     }
+    out.append(slashes * 2, L'\\');
     out.push_back(L'"');
     return out;
 }
@@ -358,7 +408,7 @@ static void print_help(const char* prog) {
         "  --version              Print version and exit\n"
         "  -h, --help             Show this help\n\n"
         "Config (same keys as CLI, overrides defaults; CLI overrides config):\n"
-        "  ~/.config/baudsh/baudsh.conf\n"
+        "  %%APPDATA%%/baudsh/baudsh.conf\n"
         "  ~/.baudsh.rc   (higher priority)\n\n"
         "Default shell (Windows): cmd.exe\n",
         prog
@@ -375,10 +425,10 @@ static bool parse_args(int argc, char** argv, Args& out) {
             return false;
         } else if (a == "--baud") {
             if (i + 1 >= argc) return false;
-            out.baud = std::atoi(argv[++i]);
+            if (!baudsh::parse_int(argv[++i], out.baud) || out.baud <= 0) return false;
         } else if (a == "--data-bits") {
             if (i + 1 >= argc) return false;
-            out.data_bits = std::atoi(argv[++i]);
+            if (!baudsh::parse_int(argv[++i], out.data_bits)) return false;
             if (!(out.data_bits == 5 || out.data_bits == 6 || out.data_bits == 7 || out.data_bits == 8)) return false;
         } else if (a == "--parity") {
             if (i + 1 >= argc) return false;
@@ -389,20 +439,19 @@ static bool parse_args(int argc, char** argv, Args& out) {
             out.parity = c;
         } else if (a == "--stop-bits") {
             if (i + 1 >= argc) return false;
-            out.stop_bits = std::atof(argv[++i]);
+            if (!baudsh::parse_double(argv[++i], out.stop_bits)) return false;
             if (!(out.stop_bits == 1.0 || out.stop_bits == 1.5 || out.stop_bits == 2.0)) return false;
         } else if (a == "--burst-ms") {
             if (i + 1 >= argc) return false;
-            out.burst_ms = std::atoi(argv[++i]);
-            if (out.burst_ms < 1) out.burst_ms = 1;
+            if (!baudsh::parse_int(argv[++i], out.burst_ms) || out.burst_ms < 1) return false;
         } else if (a == "--exit-key") {
             if (i + 1 >= argc) return false;
             out.exit_key = argv[++i];
         } else if (a == "--exit-arm-ms") {
             if (i + 1 >= argc) return false;
-            out.exit_arm_ms = std::atoi(argv[++i]);
-            if (out.exit_arm_ms < 0) out.exit_arm_ms = 0;
+            if (!baudsh::parse_int(argv[++i], out.exit_arm_ms) || out.exit_arm_ms < 0) return false;
         } else if (a == "--cmd") {
+            if (i + 1 >= argc) return false;
             out.has_cmd = true;
             out.cmd.clear();
             for (int j = i + 1; j < argc; ++j) out.cmd.emplace_back(argv[j]);
@@ -416,7 +465,11 @@ static bool parse_args(int argc, char** argv, Args& out) {
             return false;
         }
     }
-    return out.baud > 0 || out.print_effective;
+    return (out.baud > 0 || (out.baud == -1 && out.print_effective)) &&
+        (out.data_bits >= 5 && out.data_bits <= 8) &&
+        (out.parity == 'n' || out.parity == 'e' || out.parity == 'o') &&
+        (out.stop_bits == 1.0 || out.stop_bits == 1.5 || out.stop_bits == 2.0) &&
+        out.burst_ms >= 1 && out.exit_arm_ms >= 0;
 }
 
 // -------------------- ConPTY load + spawn --------------------
@@ -463,20 +516,15 @@ struct OutputCPGuard {
 
 int baudsh_windows_main(int argc, char** argv) {
     try {
+    std::vector<std::string> unicode_args = unicode_command_line_args();
+    std::vector<char*> unicode_argv;
+    unicode_argv.reserve(unicode_args.size() + 1);
+    for (auto& arg : unicode_args) unicode_argv.push_back(arg.data());
+    unicode_argv.push_back(nullptr);
+    argc = (int)unicode_args.size();
+    argv = unicode_argv.data();
     // early flags: --version / --print-default / --autocomp
     baudsh::handle_early_flags(argc, argv);
-
-    OutputCPGuard cp_guard;
-/*
-    // Save original console output codepage
-    UINT original_cp = GetConsoleOutputCP();
-
-    // Force UTF-8 so NBSP (C2 A0) renders correctly
-    SetConsoleOutputCP(65001);
-*/
-    ConsoleModeGuard cmg;
-    cmg.apply_raw_vt();
-    if (!load_conpty_symbols()) return 1;
 
     Args args;
     // apply rc defaults
@@ -513,6 +561,11 @@ int baudsh_windows_main(int argc, char** argv) {
         return 64;
     }
 
+    if (!load_conpty_symbols()) return 1;
+    OutputCPGuard cp_guard;
+    ConsoleModeGuard cmg;
+    cmg.apply_raw_vt();
+
     // Resolve exit prefix sequence
     bool exit_enabled = true;
     bool exit_is_ctrl_f7 = false;
@@ -527,6 +580,9 @@ int baudsh_windows_main(int argc, char** argv) {
             exit_is_ctrl_f7 = true;
             const unsigned char seq[] = {0x1B,'[','1','8',';','5','~'};
             exit_seq.assign(seq, seq + sizeof(seq));
+        } else if (ek.size() == 6 && ek.rfind("ctrl+", 0) == 0 &&
+                   ((ek[5] >= 'a' && ek[5] <= 'z') || (ek[5] >= '[' && ek[5] <= '_'))) {
+            exit_seq.push_back((unsigned char)(std::toupper((unsigned char)ek[5]) & 0x1f));
         } else if (ek.rfind("raw:", 0) == 0) {
             exit_seq = parse_raw_seq(args.exit_key.substr(4));
             if (exit_seq.empty()) exit_enabled = false;
@@ -536,17 +592,19 @@ int baudsh_windows_main(int argc, char** argv) {
         }
     }
 
-    // Build child argv:
-    // - no --cmd: interactive cmd.exe
-    // - --cmd single string: cmd.exe /S /C "<string>"
-    // - --cmd multi args: direct CreateProcess of argv[0] + rest
-    std::vector<std::string> child_argv;
-    if (!args.has_cmd || args.cmd.empty()) {
-        child_argv = {"cmd.exe"};
-    } else if (args.cmd.size() == 1) {
-        child_argv = {"cmd.exe", "/S", "/C", args.cmd[0]};
+    // Direct commands use CRT argv quoting. cmd.exe /S /C instead strips the
+    // outer pair of quotes and interprets the command inside as shell syntax.
+    std::wstring application;
+    std::wstring cmdline;
+    if (!args.has_cmd || args.cmd.size() == 1) {
+        std::vector<wchar_t> system_dir(32768);
+        UINT length = GetSystemDirectoryW(system_dir.data(), (UINT)system_dir.size());
+        if (!length || length >= system_dir.size()) win_die("GetSystemDirectoryW failed");
+        application = std::wstring(system_dir.data(), length) + L"\\cmd.exe";
+        cmdline = quote_arg(application);
+        if (args.has_cmd) cmdline += L" /D /S /C \"" + utf8_to_utf16(args.cmd[0]) + L"\"";
     } else {
-        child_argv = args.cmd;
+        cmdline = build_cmdline_from_utf8_argv(args.cmd);
     }
 
     // ConPTY pipes: parent<->pty
@@ -566,8 +624,13 @@ int baudsh_windows_main(int argc, char** argv) {
     COORD size{};
     size.X = 120;
     size.Y = 30;
+    CONSOLE_SCREEN_BUFFER_INFO initial_csbi{};
+    if (GetConsoleScreenBufferInfo(GetStdHandle(STD_OUTPUT_HANDLE), &initial_csbi)) {
+        size.X = initial_csbi.srWindow.Right - initial_csbi.srWindow.Left + 1;
+        size.Y = initial_csbi.srWindow.Bottom - initial_csbi.srWindow.Top + 1;
+    }
 
-    HPCON hPcon = nullptr;
+    PseudoConsoleHandle hPcon = nullptr;
     HRESULT hr = pCreatePseudoConsole(size, hPipeToPty_Read, hPipeFromPty_Write, 0, &hPcon);
     if (FAILED(hr)) {
         std::cerr << "baudsh(win): CreatePseudoConsole failed (HRESULT=0x" << std::hex << (unsigned long)hr << ")\n";
@@ -598,14 +661,13 @@ int baudsh_windows_main(int argc, char** argv) {
     }
 
     PROCESS_INFORMATION pi{};
-    std::wstring cmdline = build_cmdline_from_utf8_argv(child_argv);
 
     BOOL ok = CreateProcessW(
-        nullptr,
+        application.empty() ? nullptr : application.c_str(),
         cmdline.data(),
         nullptr,
         nullptr,
-        TRUE,
+        FALSE,
         EXTENDED_STARTUPINFO_PRESENT,
         nullptr,
         nullptr,
@@ -638,17 +700,24 @@ int baudsh_windows_main(int argc, char** argv) {
     const bool stdin_is_console = (GetFileType(hStdin) == FILE_TYPE_CHAR) && GetConsoleMode(hStdin, &__tmp_mode);
 
     std::atomic<bool> stop{false};
+    std::atomic<bool> input_finished{false};
+    std::atomic<bool> output_failed{false};
+    std::atomic<bool> input_failed{false};
+    std::atomic<bool> discard_output{false};
 
     // Input thread: stdin -> pty (with escape prefix handling + throttling)
     std::thread t_in([&]() {
+        struct FinishedGuard { std::atomic<bool>& done; ~FinishedGuard() { done.store(true); } } finished{input_finished};
         const size_t BUF_SZ = 1u << 14;
         std::vector<unsigned char> buf(BUF_SZ);
 
         auto start = std::chrono::steady_clock::now();
         bool armed = (args.exit_arm_ms == 0);
         size_t prefix_i = 0;
+        auto prefix_at = std::chrono::steady_clock::now();
 
         bool in_escape = false;
+        auto escape_at = std::chrono::steady_clock::now();
         size_t esc_prefix_i = 0;
 
         auto maybe_arm = [&]() {
@@ -664,7 +733,16 @@ int baudsh_windows_main(int argc, char** argv) {
                 std::this_thread::sleep_for(std::chrono::milliseconds(1));
                 in_bucket.refill();
             }
-            if (!write_all(hPipeToPty_Write, &b, 1)) return false;
+            if (stop.load()) return false;
+            if (!write_all(hPipeToPty_Write, &b, 1)) {
+                if (!stop.load()) {
+                    input_failed.store(true);
+                    discard_output.store(true);
+                    stop.store(true);
+                    TerminateProcess(pi.hProcess, 1);
+                }
+                return false;
+            }
             in_bucket.consume(1);
             return true;
         };
@@ -676,15 +754,31 @@ int baudsh_windows_main(int argc, char** argv) {
             return true;
         };
 
+        auto expire_escape = [&]() {
+            if (in_escape && std::chrono::steady_clock::now() - escape_at >= std::chrono::milliseconds(1500)) {
+                if (esc_prefix_i) (void)send_bytes(exit_seq.data(), esc_prefix_i);
+                esc_prefix_i = 0;
+                in_escape = false;
+            }
+        };
+
         auto process_byte = [&](unsigned char c) {
             maybe_arm();
+            expire_escape();
 
             if (exit_enabled && armed) {
+                // Native console Ctrl+F7 arrives as a key event, not bytes.
+                if (!in_escape && exit_is_ctrl_f7 && stdin_is_console) {
+                    (void)send_one(c);
+                    return;
+                }
                 if (!in_escape) {
                     if (!exit_seq.empty() && c == exit_seq[prefix_i]) {
                         prefix_i++;
+                        prefix_at = std::chrono::steady_clock::now();
                         if (prefix_i == exit_seq.size()) {
                             in_escape = true;
+                            escape_at = std::chrono::steady_clock::now();
                             esc_prefix_i = 0;
                             prefix_i = 0;
                         }
@@ -698,19 +792,8 @@ int baudsh_windows_main(int argc, char** argv) {
                         }
                     }
                 } else {
-                    if (c == '?' || c == 'h') {
-                        print_escape_help(args.exit_key, args.exit_arm_ms);
-                        in_escape = false;
-                        esc_prefix_i = 0;
-                        return;
-                    }
-                    if (c == 'q') {
-                        TerminateProcess(pi.hProcess, 1);
-                        stop.store(true);
-                        in_escape = false;
-                        esc_prefix_i = 0;
-                        return;
-                    }
+                    // A repeated prefix takes precedence over local commands,
+                    // including custom prefixes that begin with q, h or ?.
                     if (!exit_seq.empty() && c == exit_seq[esc_prefix_i]) {
                         esc_prefix_i++;
                         if (esc_prefix_i == exit_seq.size()) {
@@ -720,8 +803,32 @@ int baudsh_windows_main(int argc, char** argv) {
                         }
                         return;
                     }
+                    if (esc_prefix_i) {
+                        // A mismatched repeated prefix is input, not a local
+                        // command. Preserve both the partial prefix and byte.
+                        (void)send_bytes(exit_seq.data(), esc_prefix_i);
+                        in_escape = false;
+                        esc_prefix_i = 0;
+                        (void)send_one(c);
+                        return;
+                    }
+                    if (c == '?' || c == 'h' || c == 'H') {
+                        print_escape_help(args.exit_key, args.exit_arm_ms);
+                        in_escape = false;
+                        esc_prefix_i = 0;
+                        return;
+                    }
+                    if (c == 'q' || c == 'Q') {
+                        discard_output.store(true);
+                        stop.store(true);
+                        TerminateProcess(pi.hProcess, 1);
+                        in_escape = false;
+                        esc_prefix_i = 0;
+                        return;
+                    }
                     in_escape = false;
                     esc_prefix_i = 0;
+                    (void)send_one(c);
                     return;
                 }
             }
@@ -729,73 +836,152 @@ int baudsh_windows_main(int argc, char** argv) {
             (void)send_one(c);
         };
 
+        auto flush_partial_prefix = [&]() {
+            expire_escape();
+            if (prefix_i && std::chrono::steady_clock::now() - prefix_at >= std::chrono::milliseconds(100)) {
+                (void)send_bytes(exit_seq.data(), prefix_i);
+                prefix_i = 0;
+            }
+        };
+
         if (stdin_is_console) {
             INPUT_RECORD rec{};
             DWORD nread = 0;
+            wchar_t high_surrogate = 0;
 
             while (!stop.load()) {
-                if (!ReadConsoleInputW(hStdin, &rec, 1, &nread)) break;
+                const DWORD wait = WaitForSingleObject(hStdin, 50);
+                if (wait == WAIT_TIMEOUT) { flush_partial_prefix(); continue; }
+                if (wait != WAIT_OBJECT_0) break;
+                if (stop.load() || !ReadConsoleInputW(hStdin, &rec, 1, &nread)) break;
                 if (nread == 0) continue;
+                if (rec.EventType == WINDOW_BUFFER_SIZE_EVENT) {
+                    CONSOLE_SCREEN_BUFFER_INFO csbi{};
+                    if (GetConsoleScreenBufferInfo(hStdout, &csbi)) {
+                        COORD dims{(SHORT)(csbi.srWindow.Right - csbi.srWindow.Left + 1),
+                                   (SHORT)(csbi.srWindow.Bottom - csbi.srWindow.Top + 1)};
+                        pResizePseudoConsole(hPcon, dims);
+                    }
+                    continue;
+                }
                 if (rec.EventType != KEY_EVENT) continue;
 
                 const KEY_EVENT_RECORD& ke = rec.Event.KeyEvent;
                 if (!ke.bKeyDown) continue;
 
+                maybe_arm();
+                expire_escape();
                 if (exit_enabled && exit_is_ctrl_f7 && armed) {
                     const bool ctrl = (ke.dwControlKeyState & (LEFT_CTRL_PRESSED | RIGHT_CTRL_PRESSED)) != 0;
                     if (ctrl && ke.wVirtualKeyCode == VK_F7) {
-                        in_escape = !in_escape;
+                        if (in_escape) {
+                            (void)send_bytes(exit_seq.data(), exit_seq.size());
+                            in_escape = false;
+                        } else {
+                            in_escape = true;
+                            escape_at = std::chrono::steady_clock::now();
+                        }
                         esc_prefix_i = 0;
                         prefix_i = 0;
                         continue;
-                /*if (exit_enabled && armed) {
-                    std::string ek = args.exit_key;
-                    for (auto& ch : ek) ch = (char)std::tolower((unsigned char)ch);
-                    if (ek == "ctrl+f7") {
-                        const bool ctrl = (ke.dwControlKeyState & (LEFT_CTRL_PRESSED | RIGHT_CTRL_PRESSED)) != 0;
-                        if (ctrl && ke.wVirtualKeyCode == VK_F7) {
-                            in_escape = !in_escape;
-                            esc_prefix_i = 0;
-                            prefix_i = 0;
-                            continue;
-                        }*/
                     }
                 }
 
                 wchar_t wc = ke.uChar.UnicodeChar;
-
-                if (wc == 0) {
-                    switch (ke.wVirtualKeyCode) {
-                        case VK_RETURN:
-                            process_byte('\r');
-                            process_byte('\n');
-                            break;
-                        case VK_TAB:
-                            process_byte('	');
-                            break;
-                        case VK_BACK:
-                            process_byte('');
-                            break;
-                        default:
-                            break;
-                    }
+                const DWORD modifiers = ke.dwControlKeyState;
+                const int modifier = 1 + ((modifiers & SHIFT_PRESSED) ? 1 : 0)
+                    + ((modifiers & (LEFT_ALT_PRESSED | RIGHT_ALT_PRESSED)) ? 2 : 0)
+                    + ((modifiers & (LEFT_CTRL_PRESSED | RIGHT_CTRL_PRESSED)) ? 4 : 0);
+                if (ke.wVirtualKeyCode == VK_TAB && modifier == 2) {
+                    const char seq[] = "\x1b[Z";
+                    for (WORD repeat = 0; repeat < ke.wRepeatCount; ++repeat)
+                        for (const char* q = seq; *q; ++q) process_byte((unsigned char)*q);
                     continue;
                 }
 
+                if (wc == 0) {
+                    const char* seq = nullptr;
+                    switch (ke.wVirtualKeyCode) {
+                        case VK_UP: seq = "\x1b[A"; break;
+                        case VK_DOWN: seq = "\x1b[B"; break;
+                        case VK_RIGHT: seq = "\x1b[C"; break;
+                        case VK_LEFT: seq = "\x1b[D"; break;
+                        case VK_HOME: seq = "\x1b[H"; break;
+                        case VK_END: seq = "\x1b[F"; break;
+                        case VK_INSERT: seq = "\x1b[2~"; break;
+                        case VK_DELETE: seq = "\x1b[3~"; break;
+                        case VK_PRIOR: seq = "\x1b[5~"; break;
+                        case VK_NEXT: seq = "\x1b[6~"; break;
+                        case VK_F1: seq = "\x1bOP"; break;
+                        case VK_F2: seq = "\x1bOQ"; break;
+                        case VK_F3: seq = "\x1bOR"; break;
+                        case VK_F4: seq = "\x1bOS"; break;
+                        case VK_F5: seq = "\x1b[15~"; break;
+                        case VK_F6: seq = "\x1b[17~"; break;
+                        case VK_F7: seq = "\x1b[18~"; break;
+                        case VK_F8: seq = "\x1b[19~"; break;
+                        case VK_F9: seq = "\x1b[20~"; break;
+                        case VK_F10: seq = "\x1b[21~"; break;
+                        case VK_F11: seq = "\x1b[23~"; break;
+                        case VK_F12: seq = "\x1b[24~"; break;
+                    }
+                    std::string modified;
+                    if (seq && modifier > 1) {
+                        // xterm-compatible modifier parameter: 1 + shift + 2*alt + 4*ctrl.
+                        std::string base(seq);
+                        const char last = base.back();
+                        if (last == '~') modified = base.substr(0, base.size()-1) + ";" + std::to_string(modifier) + "~";
+                        else modified = "\x1b[1;" + std::to_string(modifier) + last;
+                        seq = modified.c_str();
+                    }
+                    if (seq) for (WORD repeat = 0; repeat < ke.wRepeatCount; ++repeat)
+                        for (const char* q = seq; *q; ++q) process_byte((unsigned char)*q);
+                    continue;
+                }
+
+                wchar_t units[2] = {wc, 0};
+                int unit_count = 1;
+                if (wc >= 0xD800 && wc <= 0xDBFF) {
+                    high_surrogate = wc;
+                    continue;
+                }
+                if (wc >= 0xDC00 && wc <= 0xDFFF && high_surrogate) {
+                    units[0] = high_surrogate;
+                    units[1] = wc;
+                    unit_count = 2;
+                }
+                high_surrogate = 0;
                 char out8[8];
-                int n = WideCharToMultiByte(CP_UTF8, 0, &wc, 1, out8, (int)sizeof(out8), nullptr, nullptr);
+                int n = WideCharToMultiByte(CP_UTF8, 0, units, unit_count, out8, (int)sizeof(out8), nullptr, nullptr);
                 if (n > 0) {
-                    for (int i = 0; i < n; ++i) process_byte((unsigned char)out8[i]);
+                    for (WORD repeat = 0; repeat < ke.wRepeatCount; ++repeat)
+                        for (int i = 0; i < n; ++i) process_byte((unsigned char)out8[i]);
                 }
             }
             return;
         }
 
+        const bool stdin_is_pipe = GetFileType(hStdin) == FILE_TYPE_PIPE;
         while (!stop.load()) {
+            if (stdin_is_pipe) {
+                DWORD available = 0;
+                if (!PeekNamedPipe(hStdin, nullptr, 0, nullptr, &available, nullptr)) break;
+                if (!available) {
+                    flush_partial_prefix();
+                    std::this_thread::sleep_for(std::chrono::milliseconds(10));
+                    continue;
+                }
+            }
             DWORD got = 0;
             if (!ReadFile(hStdin, buf.data(), (DWORD)BUF_SZ, &got, nullptr)) break;
             if (got == 0) break;
             for (DWORD bi = 0; bi < got; ++bi) process_byte(buf[bi]);
+        }
+        // EOF on redirected input is conveyed to the pseudo console.
+        if (!stop.load()) {
+            if (prefix_i) (void)send_bytes(exit_seq.data(), prefix_i);
+            if (in_escape && esc_prefix_i) (void)send_bytes(exit_seq.data(), esc_prefix_i);
+            close_handle(hPipeToPty_Write);
         }
     });
 
@@ -805,36 +991,47 @@ int baudsh_windows_main(int argc, char** argv) {
         const size_t BUF_SZ = 1u << 14;
         std::vector<unsigned char> buf(BUF_SZ);
 
-        while (!stop.load()) {
+        while (true) {
             DWORD got = 0;
             if (!ReadFile(hPipeFromPty_Read, buf.data(), (DWORD)BUF_SZ, &got, nullptr)) break;
             if (got == 0) break;
 
+            if (output_failed.load() || discard_output.load()) continue;
             size_t off = 0;
-            while (off < (size_t)got && !stop.load()) {
+            while (off < (size_t)got) {
+                if (discard_output.load()) break;
                 out_bucket.refill();
                 size_t can = out_bucket.available((size_t)got - off);
                 if (can == 0) {
                     std::this_thread::sleep_for(std::chrono::milliseconds(1));
                     continue;
                 }
-                if (!write_all(hStdout, buf.data() + off, can)) { stop.store(true); break; }
+                if (!write_all(hStdout, buf.data() + off, can)) {
+                    output_failed.store(true);
+                    TerminateProcess(pi.hProcess, 1);
+                    break; // continue draining and discard until the pipe closes
+                }
                 out_bucket.consume(can);
                 off += can;
             }
         }
     });
 
-    // Wait for child
+    // Stop input after the child exits, but keep reading output until ConPTY
+    // closes its pipe. Closing the console while the reader runs prevents the
+    // synchronous ClosePseudoConsole call from deadlocking on a full pipe.
     WaitForSingleObject(pi.hProcess, INFINITE);
     stop.store(true);
-
-    // Close pipes to unblock threads
-    close_handle(hPipeToPty_Write);
-    close_handle(hPipeFromPty_Read);
-
+    while (!input_finished.load()) {
+        CancelSynchronousIo(t_in.native_handle());
+        std::this_thread::sleep_for(std::chrono::milliseconds(2));
+    }
     if (t_in.joinable()) t_in.join();
+    close_handle(hPipeToPty_Write);
+    pClosePseudoConsole(hPcon);
+    hPcon = nullptr;
     if (t_out.joinable()) t_out.join();
+    close_handle(hPipeFromPty_Read);
 
     DWORD exit_code = 0;
     GetExitCodeProcess(pi.hProcess, &exit_code);
@@ -842,12 +1039,11 @@ int baudsh_windows_main(int argc, char** argv) {
     close_handle(pi.hThread);
     close_handle(pi.hProcess);
 
-    pClosePseudoConsole(hPcon);
 /*  // Replaced by OutputCPGuard
     // Restore original console output codepage
     SetConsoleOutputCP(original_cp);
 */
-    return (int)exit_code;
+    return (output_failed.load() || input_failed.load()) ? 1 : (int)exit_code;
     } catch (const std::exception& e) {
         std::cerr << e.what() << "\n";
         return 1;

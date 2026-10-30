@@ -19,6 +19,20 @@ STRIP   ?= strip
 
 TARGET  := baudsh
 
+# A single invocation writes one output file. Mixing build modes (or cleaning
+# while building with -j) would otherwise produce misleading or racy results.
+BUILD_GOALS := $(filter all release static debug baudsh baudsh.exe,$(MAKECMDGOALS))
+REQUESTED_MODES := $(sort $(if $(filter all release baudsh baudsh.exe,$(BUILD_GOALS)),release) $(filter static debug,$(BUILD_GOALS)))
+ifneq ($(word 2,$(REQUESTED_MODES)),)
+  $(error Choose one build mode per invocation: release, static, or debug)
+endif
+ifneq ($(filter clean,$(MAKECMDGOALS)),)
+  ifneq ($(BUILD_GOALS),)
+    $(error Run make clean separately from build targets)
+  endif
+endif
+BUILD_MODE := $(if $(REQUESTED_MODES),$(REQUESTED_MODES),release)
+
 UNAME_S := $(shell uname -s 2>/dev/null || echo Windows)
 
 # Detect Windows-like environments
@@ -46,8 +60,10 @@ SRC_WIN   := baudsh_main.cpp baudsh_win.cpp
 
 ifeq ($(IS_WIN),1)
   SRC := $(SRC_WIN)
+  HEADERS := baudsh_win.hpp
 else
   SRC := $(SRC_POSIX)
+  HEADERS := baudsh_posix_features.hpp
 endif
 
 # Common flags
@@ -58,17 +74,19 @@ OPTDBG  := -O0 -g
 
 CXXFLAGS_BASE := $(CXXSTD) $(WARN)
 LDFLAGS_BASE  :=
-LDLIBS        :=
+LDLIBS        ?=
 
 # Platform-specific libraries
-ifeq ($(UNAME_S),Linux)
-  LDLIBS += -lutil
+ifeq ($(IS_WIN),0)
+  ifeq ($(UNAME_S),Linux)
+    LDLIBS += -lutil
+  endif
 endif
 
 # Strip command differences
 STRIP_CMD := $(STRIP) --strip-all
 ifeq ($(UNAME_S),Darwin)
-  STRIP_CMD := strip -x
+  STRIP_CMD := $(STRIP) -x
 endif
 
 # Static flags (applied only for make static)
@@ -95,10 +113,12 @@ ifeq ($(IS_WIN),1)
   CXXFLAGS_BASE += -D_WIN32
 endif
 
-ifeq ($(IS_WIN),1)
-  REMOVE_CMD := del /f
+# MSYS, MinGW and Cygwin make normally run under a Unix-like shell; del is
+# a cmd.exe builtin and does not work there.  Use it only for native cmd.exe.
+ifeq ($(UNAME_S),Windows)
+  CLEAN_CMD := if exist $(TARGET) del /f /q $(TARGET) & if exist *.o del /f /q *.o
 else
-  REMOVE_CMD := rm -f
+  CLEAN_CMD := rm -f $(TARGET) *.o
 endif
 
 # --------------------------------------------------------------
@@ -109,33 +129,33 @@ endif
 all: release
 
 .PHONY: release
-release: CXXFLAGS := $(CXXFLAGS_BASE) $(OPTREL)
-release: LDFLAGS  := $(LDFLAGS_BASE)
 release: $(TARGET)
 	@echo "Stripping binary..."
-	@$(STRIP_CMD) $(TARGET) || true
+	@$(STRIP_CMD) $(TARGET)
 	@echo "Release build complete."
 
 .PHONY: static
-static: CXXFLAGS := $(CXXFLAGS_BASE) $(OPTREL)
-static: LDFLAGS  := $(LDFLAGS_BASE) $(STATIC_FLAGS)
 static: $(TARGET)
 	@echo "Stripping binary..."
-	@$(STRIP_CMD) $(TARGET) || true
+	@$(STRIP_CMD) $(TARGET)
 	@echo "Static build complete (where supported)."
 
 .PHONY: debug
-debug: CXXFLAGS := $(CXXFLAGS_BASE) $(OPTDBG)
-debug: LDFLAGS  := $(LDFLAGS_BASE)
 debug: $(TARGET)
 	@echo "Debug build complete."
 
-$(TARGET): $(SRC)
-	$(CXX) $(CXXFLAGS) $(SRC) -o $(TARGET) $(LDFLAGS) $(LDLIBS)
+# The modes share the same output filename.  Always rebuild it so switching
+# modes or changing compiler flags cannot silently reuse the wrong executable.
+# This project is small enough that a full rebuild is inexpensive.
+.PHONY: FORCE
+FORCE:
+
+$(TARGET): $(SRC) $(HEADERS) FORCE
+	$(CXX) $(CPPFLAGS) $(CXXFLAGS_BASE) $(if $(filter debug,$(BUILD_MODE)),$(OPTDBG),$(OPTREL)) $(CXXFLAGS) $(SRC) -o $(TARGET) $(LDFLAGS_BASE) $(LDFLAGS) $(if $(filter static,$(BUILD_MODE)),$(STATIC_FLAGS)) $(LDLIBS)
 
 .PHONY: clean
 clean:
-	$(REMOVE_CMD) $(TARGET) *.o
+	$(CLEAN_CMD)
 
 .PHONY: help
 help:

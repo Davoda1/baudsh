@@ -31,11 +31,14 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <cerrno>
+#include <climits>
+#include <cmath>
 #include <string>
 #include <vector>
 
 #ifndef BAUDSH_VERSION
-    #define BAUDSH_VERSION "dev"
+    #define BAUDSH_VERSION "1.0.0"
 #endif
 
 namespace baudsh {
@@ -68,6 +71,26 @@ static inline bool starts_with(const std::string& s, const char* pfx) {
 static inline std::string tolower_copy(std::string s) {
     for (char& c : s) c = (char)std::tolower((unsigned char)c);
     return s;
+}
+
+// Strict parsing shared by the command-line and configuration readers.
+static inline bool parse_int(const std::string& s, int& value) {
+    if (s.empty()) return false;
+    char* end = nullptr;
+    errno = 0;
+    long n = std::strtol(s.c_str(), &end, 10);
+    if (errno || end == s.c_str() || *end != '\0' || n < INT_MIN || n > INT_MAX) return false;
+    value = static_cast<int>(n);
+    return true;
+}
+static inline bool parse_double(const std::string& s, double& value) {
+    if (s.empty()) return false;
+    char* end = nullptr;
+    errno = 0;
+    double n = std::strtod(s.c_str(), &end);
+    if (errno || end == s.c_str() || *end != '\0' || !std::isfinite(n)) return false;
+    value = n;
+    return true;
 }
 
 // ------------------------------
@@ -121,7 +144,7 @@ static inline void print_default_config(FILE* out = stdout) {
         "# exit-key=ctrl+f7|raw:<seq>|none   (default ctrl+f7)\n"
         "# exit-arm-ms=<ms>        (default 250)\n"
         "\n"
-        "baud=2400\n"
+        "# baud=2400\n"
         "data-bits=8\n"
         "parity=n\n"
         "stop-bits=1\n"
@@ -135,46 +158,76 @@ static inline void print_default_config(FILE* out = stdout) {
 // autocomplete (for --autocomp)
 // ------------------------------
 
-static inline void print_autocomp(const std::string& shell, FILE* out = stdout) {
-    const std::string sh = tolower_copy(shell);
+static inline bool print_autocomp(const std::string& shell_raw, FILE* out = stdout) {
+    const std::string shell = tolower_copy(shell_raw);
 
-    // Keep this deliberately minimal and robust (no fancy generator).
-    // You can expand later, but this is enough to be useful and safe.
-    if (sh == "bash" || sh == "zsh" || sh == "dash") {
+    if (shell == "fish") {
         std::fprintf(out,
-            "# minimal completion for baudsh\n"
-            "_baudsh_complete() {\n"
-            "  local cur=\"${COMP_WORDS[COMP_CWORD]}\"\n"
-            "  local opts=\"--baud --data-bits --parity --stop-bits --burst-ms --exit-key --exit-arm-ms --cmd --print-effective --print-default --autocomp --version -h --help\"\n"
-            "  COMPREPLY=( $(compgen -W \"$opts\" -- \"$cur\") )\n"
-            "}\n"
-            "complete -F _baudsh_complete baudsh\n"
-        );
-        return;
-    }
-
-    if (sh == "fish") {
-        std::fprintf(out,
-            "# minimal completion for baudsh (fish)\n"
+            "# fish completion for baudsh\n"
             "complete -c baudsh -l baud -r\n"
-            "complete -c baudsh -l data-bits -r\n"
-            "complete -c baudsh -l parity -r\n"
-            "complete -c baudsh -l stop-bits -r\n"
+            "complete -c baudsh -l data-bits -r -a '5 6 7 8'\n"
+            "complete -c baudsh -l parity -r -a 'n e o'\n"
+            "complete -c baudsh -l stop-bits -r -a '1 1.5 2'\n"
             "complete -c baudsh -l burst-ms -r\n"
             "complete -c baudsh -l exit-key -r\n"
             "complete -c baudsh -l exit-arm-ms -r\n"
             "complete -c baudsh -l cmd -r\n"
-            "complete -c baudsh -l print-effective\n"
+            "complete -c baudsh -l autocomp -r -a 'dash bash zsh fish'\n"
             "complete -c baudsh -l print-default\n"
-            "complete -c baudsh -l autocomp -r\n"
+            "complete -c baudsh -l print-effective\n"
             "complete -c baudsh -l version\n"
             "complete -c baudsh -s h -l help\n"
         );
-        return;
+        return true;
     }
 
-    std::fprintf(out, "Unknown shell for --autocomp: %s\n", shell.c_str());
+    if (shell == "dash" || shell == "sh") {
+        std::fprintf(out, "# This shell does not support programmable completion.\n");
+        return true;
+    }
+    if (shell == "zsh") {
+        std::fprintf(out,
+            "# Source after compinit to enable baudsh completion.\n"
+            "_baudsh_complete() {\n"
+            "  _arguments '--baud[Baud rate]:rate:' '--data-bits[Data bits]:bits:(5 6 7 8)' \\\n"
+            "    '--parity[Parity]:parity:(n e o)' '--stop-bits[Stop bits]:bits:(1 1.5 2)' \\\n"
+            "    '--burst-ms[Burst window]:milliseconds:' '--exit-key[Escape prefix]:key:' \\\n"
+            "    '--exit-arm-ms[Escape activation delay]:milliseconds:' '--cmd[Command]:command:_command_names' \\\n"
+            "    '--autocomp[Completion shell]:shell:(dash bash zsh fish)' '--print-default[Print defaults]' \\\n"
+            "    '--print-effective[Print effective settings]' '--version[Print version]' '--help[Show help]' '-h[Show help]'\n"
+            "}\n"
+            "if (( $+functions[compdef] )); then compdef _baudsh_complete baudsh; fi\n"
+        );
+        return true;
+    }
+
+    if (shell == "bash") {
+        std::fprintf(out,
+            "# completion for baudsh (bash).\n"
+            "_baudsh_opts='--baud --data-bits --parity --stop-bits --burst-ms --exit-key --exit-arm-ms --cmd --autocomp --print-default --print-effective --version --help -h'\n"
+            "_baudsh_complete() {\n"
+            "  local cur prev\n"
+            "  cur=\"${COMP_WORDS[COMP_CWORD]}\"\n"
+            "  prev=\"${COMP_WORDS[COMP_CWORD-1]}\"\n"
+            "  case \"$prev\" in\n"
+            "    --data-bits) COMPREPLY=( $(compgen -W '5 6 7 8' -- \"$cur\") ) ;;\n"
+            "    --parity)    COMPREPLY=( $(compgen -W 'n e o' -- \"$cur\") ) ;;\n"
+            "    --stop-bits) COMPREPLY=( $(compgen -W '1 1.5 2' -- \"$cur\") ) ;;\n"
+            "    --autocomp)  COMPREPLY=( $(compgen -W 'dash bash zsh fish' -- \"$cur\") ) ;;\n"
+            "    *)           COMPREPLY=( $(compgen -W \"$_baudsh_opts\" -- \"$cur\") ) ;;\n"
+            "  esac\n"
+            "}\n"
+            "if command -v complete >/dev/null 2>&1; then\n"
+            "  complete -F _baudsh_complete baudsh\n"
+            "fi\n"
+        );
+        return true;
+    }
+
+    std::fprintf(stderr, "baudsh: unsupported shell for --autocomp: %s\n", shell_raw.c_str());
+    return false;
 }
+
 
 // ------------------------------
 // version output (for --version)
@@ -194,23 +247,23 @@ static inline void apply_kv_to_args(ArgsT& a, const std::string& key0, const std
     const std::string val = trim_copy(val0);
 
     if (key == "baud") {
-        a.baud = std::atoi(val.c_str());
+        if (!parse_int(val, a.baud) || a.baud <= 0) a.baud = 0;
         return;
     }
     if (key == "data-bits" || key == "databits") {
-        a.data_bits = std::atoi(val.c_str());
+        if (!parse_int(val, a.data_bits)) a.data_bits = -1;
         return;
     }
     if (key == "parity") {
-        if (!val.empty()) a.parity = (char)std::tolower((unsigned char)val[0]);
+        a.parity = val.size() == 1 ? (char)std::tolower((unsigned char)val[0]) : '?';
         return;
     }
     if (key == "stop-bits" || key == "stopbits") {
-        a.stop_bits = std::atof(val.c_str());
+        if (!parse_double(val, a.stop_bits)) a.stop_bits = -1;
         return;
     }
     if (key == "burst-ms" || key == "burstms") {
-        a.burst_ms = std::atoi(val.c_str());
+        if (!parse_int(val, a.burst_ms)) a.burst_ms = -1;
         return;
     }
     if (key == "exit-key" || key == "exitkey") {
@@ -218,7 +271,7 @@ static inline void apply_kv_to_args(ArgsT& a, const std::string& key0, const std
         return;
     }
     if (key == "exit-arm-ms" || key == "exitarmms") {
-        a.exit_arm_ms = std::atoi(val.c_str());
+        if (!parse_int(val, a.exit_arm_ms)) a.exit_arm_ms = -1;
         return;
     }
 
@@ -228,51 +281,64 @@ static inline void apply_kv_to_args(ArgsT& a, const std::string& key0, const std
 template <typename ArgsT>
 static inline void load_kv_file_into_args(FILE* f, ArgsT& a) {
     char buf[4096];
-
+    bool first_line = true;
     while (std::fgets(buf, sizeof(buf), f)) {
         std::string line(buf);
-
-        // trim newline
+        // Assemble complete lines rather than interpreting 4096-byte fragments
+        // as separate settings. Accept the UTF-8 BOM written by common editors.
+        while (!line.empty() && line.back() != '\n' && std::fgets(buf, sizeof(buf), f)) line += buf;
+        if (first_line && line.compare(0, 3, "\xef\xbb\xbf") == 0) line.erase(0, 3);
+        first_line = false;
         while (!line.empty() && (line.back() == '\n' || line.back() == '\r')) line.pop_back();
-
         line = ltrim_copy(line);
-        if (line.empty()) continue;
-        if (line[0] == '#' || line[0] == ';') continue;
-
-        // key=value
-        const size_t eq = line.find('=');
-        if (eq == std::string::npos) continue;
-
-        std::string key = line.substr(0, eq);
-        std::string val = line.substr(eq + 1);
-
+        if (line.empty() || line[0] == '#' || line[0] == ';') continue;
+        for (size_t i = 0; i < line.size(); ++i) {
+            if ((line[i] == '#' || line[i] == ';') && (i == 0 || std::isspace((unsigned char)line[i-1]))) {
+                line.erase(i);
+                break;
+            }
+        }
+        const size_t split = line.find_first_of("= \t");
+        if (split == std::string::npos) continue;
+        const std::string key = line.substr(0, split);
+        size_t value_start = line.find_first_not_of(" \t", split);
+        if (value_start != std::string::npos && line[value_start] == '=') ++value_start;
+        const std::string val = value_start == std::string::npos ? "" : line.substr(value_start);
         apply_kv_to_args(a, key, val);
     }
 }
 
 template <typename ArgsT>
 static inline void load_rc_files(ArgsT& a) {
-    // Lowest priority first, higher priority last.
-    std::vector<std::string> paths;
-
+    // Lowest priority first, higher priority last. Use wide paths on Windows:
+    // environment paths may contain characters outside the active ANSI codepage.
 #ifdef _WIN32
-    if (const char* appdata = std::getenv("APPDATA"); appdata && *appdata) {
-        paths.emplace_back(std::string(appdata) + "/baudsh/baudsh.conf");
+    std::vector<std::wstring> paths;
+    if (const wchar_t* appdata = _wgetenv(L"APPDATA"); appdata && *appdata)
+        paths.emplace_back(std::wstring(appdata) + L"/baudsh/baudsh.conf");
+    std::wstring home;
+    if (const wchar_t* value = _wgetenv(L"HOME"); value && *value) home = value;
+    else if (const wchar_t* value = _wgetenv(L"USERPROFILE"); value && *value) home = value;
+    else {
+        const wchar_t* drive = _wgetenv(L"HOMEDRIVE");
+        const wchar_t* path = _wgetenv(L"HOMEPATH");
+        if (drive && *drive && path && *path) home = std::wstring(drive) + path;
     }
-    paths.emplace_back("~/.baudsh.rc");
-#else
-    // If this header is ever included on POSIX, keep it sensible.
-    paths.emplace_back("~/.config/baudsh/baudsh.conf");
-    paths.emplace_back("~/.baudsh.rc");
-#endif
-
-    for (const std::string& p0 : paths) {
-        const std::string p = expand_home(p0);
-        FILE* f = std::fopen(p.c_str(), "rb");
+    if (!home.empty()) paths.emplace_back(home + L"/.baudsh.rc");
+    for (const auto& path : paths) {
+        FILE* f = _wfopen(path.c_str(), L"rb");
         if (!f) continue;
         load_kv_file_into_args(f, a);
         std::fclose(f);
     }
+#else
+    for (const char* path : {"~/.config/baudsh/baudsh.conf", "~/.baudsh.rc"}) {
+        FILE* f = std::fopen(expand_home(path).c_str(), "rb");
+        if (!f) continue;
+        load_kv_file_into_args(f, a);
+        std::fclose(f);
+    }
+#endif
 }
 
 // ------------------------------
@@ -284,6 +350,8 @@ static inline void load_rc_files(ArgsT& a) {
 static inline void handle_early_flags(int argc, char** argv) {
     for (int i = 1; i < argc; ++i) {
         const std::string a = argv[i];
+
+        if (a == "--cmd") break;
 
         if (a == "--version") {
             print_version(stdout);
@@ -300,8 +368,12 @@ static inline void handle_early_flags(int argc, char** argv) {
                 std::fprintf(stderr, "baudsh: --autocomp requires an argument (dash|bash|zsh|fish)\n");
                 std::exit(64);
             }
-            print_autocomp(argv[i + 1], stdout);
-            std::exit(0);
+            std::exit(print_autocomp(argv[i + 1], stdout) ? 0 : 64);
+        }
+        if (a == "--baud" || a == "--data-bits" || a == "--parity" ||
+            a == "--stop-bits" || a == "--burst-ms" || a == "--exit-key" ||
+            a == "--exit-arm-ms") {
+            if (i + 1 < argc) ++i;
         }
     }
 }
