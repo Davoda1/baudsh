@@ -350,12 +350,21 @@ class WindowsTerminalTests(IsolatedTest):
         self.assertEqual(output.count("Z"), 50)
 
     def test_partial_second_prefix_does_not_quit(self):
+        self.receive_custom_prefix("raw:abc", b"abcabq", b"abq")
+
+    def test_short_hex_like_prefix_is_literal(self):
+        self.receive_custom_prefix("raw:ab", b"abaq", b"aq")
+
+    def test_legacy_spaced_hex_prefix(self):
+        self.receive_custom_prefix("raw:61 62 63", b"abcabq", b"abq")
+
+    def receive_custom_prefix(self, prefix, payload, expected):
         # getwch() reads console key events without enabling line buffering.
         code = ("import msvcrt;print('READY',flush=True);"
-                "data=''.join(msvcrt.getwch() for _ in range(3));"
+                f"data=''.join(msvcrt.getwch() for _ in range({len(expected)}));"
                 "print('HEX:'+data.encode('utf-8').hex(),flush=True)")
         process = subprocess.Popen([str(BINARY), "--baud", "10000000", "--exit-arm-ms", "0",
-                                    "--exit-key", "raw:abc",
+                                    "--exit-key", prefix,
                                     "--cmd", sys.executable, "-c", code],
                                    stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
                                    env=self.env)
@@ -375,12 +384,12 @@ class WindowsTerminalTests(IsolatedTest):
         reader.start()
         try:
             self.assertTrue(ready.wait(10), "ConPTY child did not become ready")
-            process.stdin.write(b"abcabq")
+            process.stdin.write(payload)
             process.stdin.flush()
             self.assertEqual(process.wait(timeout=10), 0)
             reader.join(timeout=5)
             self.assertFalse(reader.is_alive(), "output pipe did not close")
-            self.assertIn(b"HEX:616271", output)
+            self.assertIn(b"HEX:" + expected.hex().encode(), output)
         finally:
             if process.poll() is None:
                 process.kill()

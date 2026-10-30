@@ -909,4 +909,3 @@ while (!input_closed && !master_eof && !child_exited && stdin_buf.size() < BUFFE
     if (WIFSIGNALED(child_status)) return 128 + WTERMSIG(child_status);
     return 1;
 }
-

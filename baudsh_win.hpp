@@ -317,8 +317,8 @@ static inline void load_rc_files(ArgsT& a) {
     if (const wchar_t* appdata = _wgetenv(L"APPDATA"); appdata && *appdata)
         paths.emplace_back(std::wstring(appdata) + L"/baudsh/baudsh.conf");
     std::wstring home;
-    if (const wchar_t* value = _wgetenv(L"HOME"); value && *value) home = value;
-    else if (const wchar_t* value = _wgetenv(L"USERPROFILE"); value && *value) home = value;
+    if (const wchar_t* home_value = _wgetenv(L"HOME"); home_value && *home_value) home = home_value;
+    else if (const wchar_t* profile_value = _wgetenv(L"USERPROFILE"); profile_value && *profile_value) home = profile_value;
     else {
         const wchar_t* drive = _wgetenv(L"HOMEDRIVE");
         const wchar_t* path = _wgetenv(L"HOMEPATH");

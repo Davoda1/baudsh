@@ -288,31 +288,23 @@ static std::vector<unsigned char> parse_raw_seq(const std::string& s0) {
     std::vector<unsigned char> out;
     out.reserve(s.size());
 
-    // If it looks like hex bytes separated by whitespace, parse that.
-    bool maybe_hex_bytes = false;
-    for (char c : s) {
-        if (std::isxdigit((unsigned char)c) || std::isspace((unsigned char)c)) {
-            maybe_hex_bytes = true;
-        } else {
-            maybe_hex_bytes = false;
+    // Keep the legacy spaced-hex form only when every token is a complete
+    // byte and there are multiple tokens. A literal such as "abc" or "ab"
+    // must not be guessed as hex or silently truncated.
+    std::vector<unsigned char> hex_bytes;
+    bool valid_hex = true;
+    for (size_t i = 0; i < s.size();) {
+        while (i < s.size() && std::isspace((unsigned char)s[i])) ++i;
+        if (i == s.size()) break;
+        const size_t begin = i;
+        while (i < s.size() && !std::isspace((unsigned char)s[i])) ++i;
+        if (i - begin != 2 || hexval(s[begin]) < 0 || hexval(s[begin + 1]) < 0) {
+            valid_hex = false;
             break;
         }
+        hex_bytes.push_back((unsigned char)((hexval(s[begin]) << 4) | hexval(s[begin + 1])));
     }
-    if (maybe_hex_bytes) {
-        size_t i = 0;
-        while (i < s.size()) {
-            while (i < s.size() && std::isspace((unsigned char)s[i])) i++;
-            if (i >= s.size()) break;
-            if (i + 1 >= s.size()) break;
-            int h1 = hexval(s[i]);
-            int h2 = hexval(s[i + 1]);
-            if (h1 < 0 || h2 < 0) break;
-            out.push_back((unsigned char)((h1 << 4) | h2));
-            i += 2;
-            while (i < s.size() && !std::isspace((unsigned char)s[i])) i++;
-        }
-        return out;
-    }
+    if (valid_hex && hex_bytes.size() >= 2) return hex_bytes;
 
     // Otherwise parse backslash escapes.
     for (size_t i = 0; i < s.size(); ++i) {

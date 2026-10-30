@@ -26,6 +26,7 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
+          fetch-depth: 2
       - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
         with:
           python-version: '3.13'
@@ -60,7 +61,7 @@ jobs:
         run: |
           for /f "usebackq tokens=*" %%i in (`"C:\Program Files (x86)\Microsoft Visual Studio\Installer\vswhere.exe" -latest -products * -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath`) do call "%%i\VC\Auxiliary\Build\vcvars64.bat"
           if errorlevel 1 exit /b %errorlevel%
-          cl /nologo /std:c++17 /EHsc /W4 /O2 /MT /D_CRT_SECURE_NO_WARNINGS baudsh_main.cpp baudsh_win.cpp /Fe:baudsh.exe
+          cl /nologo /std:c++17 /EHsc /W4 /WX /O2 /MT /D_CRT_SECURE_NO_WARNINGS baudsh_main.cpp baudsh_win.cpp /Fe:baudsh.exe
           if errorlevel 1 exit /b %errorlevel%
       - name: Run native Windows regression tests
         run: python -m unittest discover -s tests -v
