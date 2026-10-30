@@ -1,0 +1,10 @@
+/baudsh
+/baudsh.exe
+*.o
+*.obj
+*.pdb
+*.ilk
+__pycache__/
+*.pyc
+/dist/
+/build/

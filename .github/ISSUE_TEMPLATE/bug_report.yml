@@ -1,0 +1,28 @@
+name: Bug report
+description: Report a reproducible problem with baudsh.
+title: "Bug: "
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Please include a minimal reproduction. Remove passwords, tokens, private paths and other sensitive information from commands and logs.
+  - type: textarea
+    id: environment
+    attributes:
+      label: Environment
+      description: Operating system, terminal application, shell, baudsh version and build method.
+    validations:
+      required: true
+  - type: textarea
+    id: reproduction
+    attributes:
+      label: Steps to reproduce
+      description: Include the command and relevant configuration settings.
+    validations:
+      required: true
+  - type: textarea
+    id: behavior
+    attributes:
+      label: Expected and actual behavior
+    validations:
+      required: true
